@@ -1,0 +1,1193 @@
+-- ====================================================================
+-- 🌙 LUNAR HUB | WarZPVP Auto Fishing & Auto Stash System
+-- ====================================================================
+-- Features:
+--   - 🌙 LUNAR HUB Modern Glow UI with Draggable Floating Toggle Button
+--   - 🎣 Selectable Rods (RodSpider, RodTiktok)
+--   - 🪱 Selectable Baits (BaitSpider, BaitChubby)
+--   - 🛒 Auto-Buy Bait from In-game Shop
+--   - 📦 Auto-Stash (เก็บของเข้าคลังทั้งหมดอัตโนมัติเมื่อกระเป๋าเต็ม)
+--   - 📍 Set Fishing Spot (เดินเอง ไม่วาป ไม่บิน ปลอดภัยจากแอนตี้ชีต)
+--   - 🎯 3D Visual World Markers (จุดยืน + จุดทุ่นน้ำ)
+--   - ⚡ Fast Precision Auto-Reel (ตวัดจังหวะ Perfect Hit)
+-- ====================================================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Clean up any existing instances
+if _G.LunarHubRunning then
+    _G.LunarHubRunning = false
+end
+if _G.LunarHubCleanup then
+    pcall(_G.LunarHubCleanup)
+end
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+if not Remotes then
+    warn("[LUNAR HUB] Remotes folder not found!")
+    return
+end
+
+local FishingStart = Remotes:WaitForChild("FishingStart", 10)
+local FishingReel = Remotes:WaitForChild("FishingReel", 10)
+local FishingCancel = Remotes:WaitForChild("FishingCancel", 10)
+local FishingState = Remotes:WaitForChild("FishingState", 10)
+local BuyItem = Remotes:WaitForChild("BuyItem", 10)
+local SwitchWeaponRequest = Remotes:WaitForChild("SwitchWeaponRequest", 10)
+local SwapBagSlot = Remotes:WaitForChild("SwapBagSlot", 10)
+local BagAllToStash = Remotes:WaitForChild("BagAllToStash", 10)
+
+-- Inventory / State Reader via App Hook
+local appStateFunc = nil
+pcall(function()
+    local Fishing = require(LocalPlayer.PlayerScripts.Client.world.Fishing)
+    local upvals = getupvalues(Fishing.Build)
+    for _, v in pairs(upvals) do
+        if typeof(v) == "function" then
+            local ok, r = pcall(v)
+            if ok and typeof(r) == "table" and r.profile ~= nil then
+                appStateFunc = v
+                break
+            end
+        end
+    end
+end)
+
+local function getProfile()
+    if appStateFunc then
+        local ok, s = pcall(appStateFunc)
+        if ok and s and s.profile then
+            return s.profile
+        end
+    end
+    return nil
+end
+
+local function getBackpack()
+    local profile = getProfile()
+    return profile and profile.Backpack
+end
+
+local function getBackpackSlots()
+    local bp = getBackpack()
+    return (bp and bp.Slots) or {}
+end
+
+local function getMoney()
+    local profile = getProfile()
+    return (profile and profile.Money) or 0
+end
+
+local function findItemSlot(targetId)
+    local slots = getBackpackSlots()
+    for s = 1, 6 do
+        if slots[s] and slots[s].ItemId == targetId then
+            return s
+        end
+    end
+    for s, item in pairs(slots) do
+        if item.ItemId == targetId then
+            return s
+        end
+    end
+    return nil
+end
+
+local function countBait(targetBaitId)
+    local slots = getBackpackSlots()
+    local total = 0
+    local firstSlot = nil
+    for s, item in pairs(slots) do
+        if item.ItemId == targetBaitId then
+            total = total + (item.Quantity or 1)
+            if not firstSlot then
+                firstSlot = s
+            end
+        end
+    end
+    return total, firstSlot
+end
+
+local function getBackpackCapacity()
+    local bp = getBackpack()
+    if not bp then return 100, 0, 0, 100 end
+    local emptySlots = 0
+    local filledSlots = 0
+    local slots = bp.Slots or {}
+    for s = 9, (bp.Size or 108) do
+        local it = slots[s]
+        if not it or it.ItemId == "" or it.ItemId == nil then
+            emptySlots = emptySlots + 1
+        else
+            filledSlots = filledSlots + 1
+        end
+    end
+    return emptySlots, filledSlots, bp.Weight or 0, bp.WeightMax or 120
+end
+
+-- ====================================================================
+-- State Configuration
+-- ====================================================================
+local Rods = {
+    { id = "RodSpider", name = "เบ็ดใยทมิฬ", price = 2500, defaultBait = "BaitSpider" },
+    { id = "RodTiktok", name = "เบ็ดตกปลา", price = 10000, defaultBait = "BaitChubby" }
+}
+
+local Baits = {
+    { id = "BaitSpider", name = "เหยื่อแมงมุมใยทมิฬ", price = 1000, compatibleRod = "RodSpider" },
+    { id = "BaitChubby", name = "เหยื่อ Chubby", price = 200, compatibleRod = "RodTiktok" }
+}
+
+local State = {
+    enabled = false,
+    selectedRod = "RodSpider",
+    selectedBait = "BaitSpider",
+    autoBuyBait = true,
+    buyAmount = 5,
+    autoStash = true,
+    maxDistanceTolerance = 7.5,
+    
+    savedSpot = nil, -- { playerPos = Vector3, castPos = Vector3 }
+    currentPhase = "idle",
+    activeCastId = nil,
+    reelData = nil,
+    reelFired = false,
+    
+    totalCatches = 0,
+    lastLoot = "-",
+    statusText = "🌙 LUNAR HUB พร้อมใช้งาน (กรุณาเซ็ตจุดตกปลา)",
+    isBuying = false,
+    lastStashTime = 0
+}
+
+-- Auto detect player owned rod
+if findItemSlot("RodSpider") then
+    State.selectedRod = "RodSpider"
+    State.selectedBait = "BaitSpider"
+elseif findItemSlot("RodTiktok") then
+    State.selectedRod = "RodTiktok"
+    State.selectedBait = "BaitChubby"
+end
+
+-- ====================================================================
+-- 3D Visual World Markers
+-- ====================================================================
+local VisualFolder = Instance.new("Folder")
+VisualFolder.Name = "LunarHub_Markers"
+VisualFolder.Parent = Workspace
+
+local playerMarkerPart = nil
+local castMarkerPart = nil
+
+local function updateMarkers()
+    if not State.savedSpot then
+        if playerMarkerPart then playerMarkerPart:Destroy(); playerMarkerPart = nil end
+        if castMarkerPart then castMarkerPart:Destroy(); castMarkerPart = nil end
+        return
+    end
+
+    if not playerMarkerPart or not playerMarkerPart.Parent then
+        playerMarkerPart = Instance.new("Part")
+        playerMarkerPart.Name = "Lunar_PlayerSpot"
+        playerMarkerPart.Shape = Enum.PartType.Cylinder
+        playerMarkerPart.Size = Vector3.new(0.35, 5, 5)
+        playerMarkerPart.CFrame = CFrame.new(State.savedSpot.playerPos - Vector3.new(0, 2.7, 0)) * CFrame.Angles(0, 0, math.rad(90))
+        playerMarkerPart.Anchored = true
+        playerMarkerPart.CanCollide = false
+        playerMarkerPart.Material = Enum.Material.Neon
+        playerMarkerPart.Color = Color3.fromRGB(168, 85, 247)
+        playerMarkerPart.Transparency = 0.45
+        playerMarkerPart.Parent = VisualFolder
+
+        local bb = Instance.new("BillboardGui")
+        bb.Size = UDim2.fromOffset(130, 26)
+        bb.StudsOffset = Vector3.new(0, 2.5, 0)
+        bb.AlwaysOnTop = true
+        bb.Parent = playerMarkerPart
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.fromScale(1, 1)
+        lbl.BackgroundTransparency = 0.25
+        lbl.BackgroundColor3 = Color3.fromRGB(24, 18, 43)
+        lbl.Text = "📍 จุดยืนตกปลา"
+        lbl.TextColor3 = Color3.fromRGB(243, 232, 255)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 13
+        lbl.Parent = bb
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = lbl
+    else
+        playerMarkerPart.CFrame = CFrame.new(State.savedSpot.playerPos - Vector3.new(0, 2.7, 0)) * CFrame.Angles(0, 0, math.rad(90))
+    end
+
+    if not castMarkerPart or not castMarkerPart.Parent then
+        castMarkerPart = Instance.new("Part")
+        castMarkerPart.Name = "Lunar_CastSpot"
+        castMarkerPart.Shape = Enum.PartType.Ball
+        castMarkerPart.Size = Vector3.new(1.8, 1.8, 1.8)
+        castMarkerPart.CFrame = CFrame.new(State.savedSpot.castPos)
+        castMarkerPart.Anchored = true
+        castMarkerPart.CanCollide = false
+        castMarkerPart.Material = Enum.Material.Neon
+        castMarkerPart.Color = Color3.fromRGB(56, 189, 248)
+        castMarkerPart.Transparency = 0.3
+        castMarkerPart.Parent = VisualFolder
+
+        local bb = Instance.new("BillboardGui")
+        bb.Size = UDim2.fromOffset(130, 26)
+        bb.StudsOffset = Vector3.new(0, 2.2, 0)
+        bb.AlwaysOnTop = true
+        bb.Parent = castMarkerPart
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.fromScale(1, 1)
+        lbl.BackgroundTransparency = 0.25
+        lbl.BackgroundColor3 = Color3.fromRGB(24, 18, 43)
+        lbl.Text = "🎯 จุดลงเหยื่อ"
+        lbl.TextColor3 = Color3.fromRGB(224, 242, 254)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 13
+        lbl.Parent = bb
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = lbl
+    else
+        castMarkerPart.CFrame = CFrame.new(State.savedSpot.castPos)
+    end
+end
+
+-- Water detection & cast calculation
+local function calculateCastTarget()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local cam = Workspace.CurrentCamera
+    local look = (cam and cam.CFrame.LookVector) or hrp.CFrame.LookVector
+    local startPos = hrp.Position + Vector3.new(0, 1.5, 0)
+
+    -- 1. Raycast towards water
+    local rp = RaycastParams.new()
+    rp.FilterDescendantsInstances = { char, VisualFolder }
+    rp.FilterType = Enum.RaycastFilterType.Exclude
+    rp.IgnoreWater = false
+
+    local castDir = (look * 30 - Vector3.new(0, 14, 0)).Unit * 50
+    local hit = Workspace:Raycast(startPos, castDir, rp)
+    if hit and hit.Material == Enum.Material.Water then
+        return hit.Position
+    end
+
+    local hitDirect = Workspace:Raycast(startPos, look * 45, rp)
+    if hitDirect and hitDirect.Material == Enum.Material.Water then
+        return hitDirect.Position
+    end
+
+    -- 2. Search Terrain water voxels
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    if terrain then
+        local center = hrp.Position + look * 20
+        local region = Region3.new(center - Vector3.new(28, 16, 28), center + Vector3.new(28, 16, 28)):ExpandToGrid(4)
+        local ok, materials = pcall(function() return terrain:ReadVoxels(region, 4) end)
+        if ok and materials then
+            local minBound = region.CFrame.Position - region.Size / 2
+            local size = materials.Size
+            local bestPos = nil
+            local bestDist = 9999
+            for x = 1, size.X do
+                for y = 1, size.Y do
+                    for z = 1, size.Z do
+                        if materials[x][y][z] == Enum.Material.Water then
+                            local wPos = minBound + Vector3.new((x - 0.5) * 4, (y - 0.5) * 4, (z - 0.5) * 4)
+                            local dist = (wPos - hrp.Position).Magnitude
+                            if dist >= 8 and dist < bestDist then
+                                bestDist = dist
+                                bestPos = wPos
+                            end
+                        end
+                    end
+                end
+            end
+            if bestPos then
+                return bestPos
+            end
+        end
+    end
+
+    return hrp.Position + look * 25 - Vector3.new(0, 4, 0)
+end
+
+-- ====================================================================
+-- Remote Listeners & Reel Automation
+-- ====================================================================
+local stateConnection = FishingState.OnClientEvent:Connect(function(data)
+    if typeof(data) ~= "table" or typeof(data.phase) ~= "string" then return end
+    
+    if data.phase == "cast" then
+        State.currentPhase = "cast"
+        State.activeCastId = data.castId
+        State.reelFired = false
+        State.reelData = nil
+        State.statusText = "กำลังเหวี่ยงเบ็ด... รอปลากินเหยื่อ"
+        
+    elseif data.phase == "reel" then
+        State.currentPhase = "reel"
+        State.activeCastId = data.castId
+        State.reelData = data
+        State.reelFired = false
+        State.statusText = "ปลากินเบ็ดแล้ว! กำลังตวัดอัตโนมัติ..."
+        
+    elseif data.phase == "result" then
+        State.currentPhase = "result"
+        State.reelData = nil
+        State.reelFired = false
+        
+        if data.ok then
+            State.totalCatches = State.totalCatches + 1
+            local rewards = data.rewards or { { name = data.name or data.itemId, qty = data.qty or 1 } }
+            local list = {}
+            for _, r in ipairs(rewards) do
+                table.insert(list, string.format("%s ×%d", tostring(r.name or r.itemId or "ปลา"), tonumber(r.qty) or 1))
+            end
+            State.lastLoot = table.concat(list, ", ")
+            State.statusText = "ตกสำเร็จ! ได้: " .. State.lastLoot
+        else
+            State.statusText = "ปลาหลุด / ไม่ติดเบ็ด (" .. tostring(data.message or "Miss") .. ")"
+        end
+        
+        task.delay(2.6, function()
+            if State.currentPhase == "result" then
+                State.currentPhase = "idle"
+            end
+        end)
+        
+    elseif data.phase == "cancel" then
+        State.currentPhase = "idle"
+        State.reelData = nil
+        State.reelFired = false
+        State.statusText = "การตกปลาถูกยกเลิก"
+    end
+end)
+
+-- Precision Reel Monitor (Runs on Heartbeat)
+local reelConnection = RunService.Heartbeat:Connect(function()
+    if not State.enabled then return end
+    if State.currentPhase == "reel" and State.reelData and not State.reelFired then
+        local data = State.reelData
+        local now = Workspace:GetServerTimeNow()
+        
+        local marker = (now - data.biteAt) * data.speed % 2
+        if marker < 0 then marker = marker + 2 end
+        if marker >= 1 then marker = 2 - marker end
+        
+        local diff = math.abs(marker - data.zoneCenter)
+        local safeZone = (data.zoneWidth or 0.3) * 0.38
+        
+        if diff <= safeZone or (now >= (data.deadline or 0) - 0.15) then
+            State.reelFired = true
+            FishingReel:FireServer(data.castId, now)
+            State.currentPhase = "waiting_result"
+            State.statusText = "ตวัดเบ็ดสำเร็จ! กำลังดึงปลา..."
+        end
+    end
+end)
+
+-- Helper: Auto Stash All Items to Warehouse
+local function performAutoStash()
+    if os.clock() - State.lastStashTime < 3.0 then return end
+    State.lastStashTime = os.clock()
+    
+    -- Ensure bait is kept in slot 5 so BagAllToStash doesn't dump the active bait
+    local _, bSlot = countBait(State.selectedBait)
+    if bSlot and bSlot >= 9 then
+        SwapBagSlot:FireServer(bSlot, 5)
+        task.wait(0.3)
+    end
+    
+    State.statusText = "📦 กระเป๋าเต็ม! กำลังเก็บของเข้าคลังทั้งหมด..."
+    BagAllToStash:FireServer()
+    task.wait(0.8)
+    State.statusText = "เก็บของเข้าคลังเรียบร้อย! พร้อมตกปลาต่อ"
+end
+
+-- Main Automation Cycle
+_G.LunarHubRunning = true
+task.spawn(function()
+    while _G.LunarHubRunning do
+        task.wait(0.4)
+        
+        if State.enabled then
+            if not State.savedSpot then
+                State.statusText = "กรุณากด 'เซ็ตจุดตกปลา' ก่อนเริ่ม"
+            else
+                local char = LocalPlayer.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                
+                if hrp then
+                    local dist = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(State.savedSpot.playerPos.X, 0, State.savedSpot.playerPos.Z)).Magnitude
+                    
+                    if dist > State.maxDistanceTolerance then
+                        -- Manual walking only: strictly no fly, no teleport
+                        State.statusText = string.format("กรุณาเดินไปยังจุดตกปลา (ห่าง %.1f m)", dist)
+                    else
+                        -- Check Auto Stash condition
+                        if State.autoStash then
+                            local emptySlots, _, weight, weightMax = getBackpackCapacity()
+                            if emptySlots <= 2 or weight >= (weightMax - 1) then
+                                performAutoStash()
+                            end
+                        end
+                        
+                        -- Auto Fishing Cycle
+                        if State.currentPhase == "idle" then
+                            -- 1. Check Bait count
+                            local bCount, bSlot = countBait(State.selectedBait)
+                            if bCount <= 0 then
+                                if State.autoBuyBait and not State.isBuying then
+                                    State.isBuying = true
+                                    State.statusText = "เหยื่อหมด! กำลังซื้อเหยื่ออัตโนมัติ..."
+                                    local money = getMoney()
+                                    local baitPrice = 200
+                                    for _, b in ipairs(Baits) do
+                                        if b.id == State.selectedBait then baitPrice = b.price break end
+                                    end
+                                    
+                                    if money >= baitPrice then
+                                        BuyItem:FireServer(State.selectedBait, State.buyAmount)
+                                        task.wait(0.65)
+                                        bCount, bSlot = countBait(State.selectedBait)
+                                        State.isBuying = false
+                                        if bCount <= 0 then
+                                            State.statusText = "ซื้อเหยื่อไม่สำเร็จ (เงินไม่พอหรือกระเป๋าเต็ม)"
+                                        end
+                                    else
+                                        State.isBuying = false
+                                        State.statusText = "เงินไม่พอซื้อเหยื่อ (" .. money .. " ฿)"
+                                    end
+                                else
+                                    State.statusText = "เหยื่อหมด! กรุณาเปิด Auto Buy หรือเติมเหยื่อ"
+                                end
+                            else
+                                -- 2. Check Rod
+                                local rSlot = findItemSlot(State.selectedRod)
+                                if not rSlot then
+                                    State.statusText = "ไม่พบเบ็ด '" .. State.selectedRod .. "' ในตัว"
+                                else
+                                    -- If rod is in backpack storage (> 6), move to hotbar slot 6
+                                    if rSlot > 6 then
+                                        State.statusText = "กำลังย้ายเบ็ดมาใส่ช่องมือ (Slot 6)..."
+                                        SwapBagSlot:FireServer(rSlot, 6)
+                                        task.wait(0.35)
+                                        rSlot = 6
+                                    end
+                                    
+                                    -- Equip rod to hand
+                                    local active = tonumber(LocalPlayer:GetAttribute("CSGO_ActiveSlot")) or 0
+                                    if active ~= rSlot then
+                                        SwitchWeaponRequest:FireServer(rSlot)
+                                        task.wait(0.35)
+                                    end
+                                    
+                                    -- Re-verify bait slot
+                                    _, bSlot = countBait(State.selectedBait)
+                                    if bSlot then
+                                        State.statusText = "กำลังเหวี่ยงเบ็ดไปที่จุดตกปลา..."
+                                        FishingStart:FireServer(rSlot, bSlot, State.savedSpot.castPos)
+                                        task.wait(1.0)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- ====================================================================
+-- 🌙 LUNAR HUB UI DESIGN
+-- ====================================================================
+local GuiParent = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or CoreGui or LocalPlayer:WaitForChild("PlayerGui")
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "LunarHub_GUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent = GuiParent
+
+-- ----------------------------------------------------
+-- Floating Toggle UI (ปุ่มลอยสำหรับเปิด/ปิดเมนู)
+-- ----------------------------------------------------
+local FloatingToggle = Instance.new("Frame")
+FloatingToggle.Name = "FloatingToggle"
+FloatingToggle.Size = UDim2.fromOffset(130, 40)
+FloatingToggle.Position = UDim2.new(0, 20, 0.25, 0)
+FloatingToggle.BackgroundColor3 = Color3.fromRGB(24, 18, 43)
+FloatingToggle.BorderSizePixel = 0
+FloatingToggle.Parent = ScreenGui
+
+local ftCorner = Instance.new("UICorner")
+ftCorner.CornerRadius = UDim.new(0, 20)
+ftCorner.Parent = FloatingToggle
+
+local ftStroke = Instance.new("UIStroke")
+ftStroke.Color = Color3.fromRGB(168, 85, 247)
+ftStroke.Thickness = 1.8
+ftStroke.Parent = FloatingToggle
+
+local ftBtn = Instance.new("TextButton")
+ftBtn.Size = UDim2.fromScale(1, 1)
+ftBtn.BackgroundTransparency = 1
+ftBtn.Text = "🌙 LUNAR HUB"
+ftBtn.TextColor3 = Color3.fromRGB(243, 232, 255)
+ftBtn.Font = Enum.Font.GothamBlack
+ftBtn.TextSize = 12
+ftBtn.Parent = FloatingToggle
+
+-- Make Floating Button Draggable
+local ftDragging, ftDragInput, ftDragStart, ftStartPos
+FloatingToggle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        ftDragging = true
+        ftDragStart = input.Position
+        ftStartPos = FloatingToggle.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                ftDragging = false
+            end
+        end)
+    end
+end)
+
+FloatingToggle.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        ftDragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == ftDragInput and ftDragging then
+        local delta = input.Position - ftDragStart
+        FloatingToggle.Position = UDim2.new(ftStartPos.X.Scale, ftStartPos.X.Offset + delta.X, ftStartPos.Y.Scale, ftStartPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- ----------------------------------------------------
+-- Main Card Window
+-- ----------------------------------------------------
+local MainCard = Instance.new("Frame")
+MainCard.Name = "MainCard"
+MainCard.Size = UDim2.fromOffset(430, 580)
+MainCard.Position = UDim2.new(0.5, -215, 0.5, -290)
+MainCard.BackgroundColor3 = Color3.fromRGB(13, 15, 26)
+MainCard.BorderSizePixel = 0
+MainCard.ClipsDescendants = true
+MainCard.Parent = ScreenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 14)
+mainCorner.Parent = MainCard
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(147, 51, 234)
+mainStroke.Thickness = 1.8
+mainStroke.Parent = MainCard
+
+-- Toggle MainCard Visibility
+ftBtn.MouseButton1Click:Connect(function()
+    MainCard.Visible = not MainCard.Visible
+end)
+
+-- Header Frame
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.new(1, 0, 0, 54)
+Header.BackgroundColor3 = Color3.fromRGB(24, 18, 43)
+Header.BorderSizePixel = 0
+Header.Parent = MainCard
+
+local headerCorner = Instance.new("UICorner")
+headerCorner.CornerRadius = UDim.new(0, 14)
+headerCorner.Parent = Header
+
+local headerFlat = Instance.new("Frame")
+headerFlat.Size = UDim2.new(1, 0, 0, 14)
+headerFlat.Position = UDim2.new(0, 0, 1, -14)
+headerFlat.BackgroundColor3 = Color3.fromRGB(24, 18, 43)
+headerFlat.BorderSizePixel = 0
+headerFlat.Parent = Header
+
+local Title = Instance.new("TextLabel")
+Title.Text = "🌙 LUNAR HUB"
+Title.Font = Enum.Font.GothamBlack
+Title.TextSize = 17
+Title.TextColor3 = Color3.fromRGB(243, 232, 255)
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Position = UDim2.fromOffset(16, 8)
+Title.Size = UDim2.new(1, -120, 0, 20)
+Title.BackgroundTransparency = 1
+Title.Parent = Header
+
+local Subtitle = Instance.new("TextLabel")
+Subtitle.Text = "WarZ Auto-Fisher • Auto-Stash • เดินเอง ไม่วาป"
+Subtitle.Font = Enum.Font.GothamMedium
+Subtitle.TextSize = 11
+Subtitle.TextColor3 = Color3.fromRGB(192, 132, 252)
+Subtitle.TextXAlignment = Enum.TextXAlignment.Left
+Subtitle.Position = UDim2.fromOffset(16, 30)
+Subtitle.Size = UDim2.new(1, -120, 0, 16)
+Subtitle.BackgroundTransparency = 1
+Subtitle.Parent = Header
+
+-- Close Button
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.fromOffset(32, 32)
+CloseBtn.Position = UDim2.new(1, -42, 0, 11)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(46, 28, 77)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.fromRGB(243, 232, 255)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.Parent = Header
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = CloseBtn
+
+CloseBtn.MouseButton1Click:Connect(function()
+    MainCard.Visible = false
+end)
+
+-- Dragging for MainCard
+local mcDragging, mcDragInput, mcDragStart, mcStartPos
+Header.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        mcDragging = true
+        mcDragStart = input.Position
+        mcStartPos = MainCard.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                mcDragging = false
+            end
+        end)
+    end
+end)
+
+Header.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        mcDragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == mcDragInput and mcDragging then
+        local delta = input.Position - mcDragStart
+        MainCard.Position = UDim2.new(mcStartPos.X.Scale, mcStartPos.X.Offset + delta.X, mcStartPos.Y.Scale, mcStartPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- Content Scroll Area
+local ContentScroll = Instance.new("ScrollingFrame")
+ContentScroll.Size = UDim2.new(1, -24, 1, -66)
+ContentScroll.Position = UDim2.fromOffset(12, 60)
+ContentScroll.BackgroundTransparency = 1
+ContentScroll.BorderSizePixel = 0
+ContentScroll.ScrollBarThickness = 4
+ContentScroll.ScrollBarImageColor3 = Color3.fromRGB(147, 51, 234)
+ContentScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+ContentScroll.CanvasSize = UDim2.new()
+ContentScroll.Parent = MainCard
+
+local contentLayout = Instance.new("UIListLayout")
+contentLayout.Padding = UDim.new(0, 10)
+contentLayout.SortOrder = Enum.SortOrder.LayoutOrder
+contentLayout.Parent = ContentScroll
+
+-- Helper: Create Card Frame
+local function createCard(titleText, height, layoutOrder)
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, 0, 0, height)
+    card.BackgroundColor3 = Color3.fromRGB(20, 24, 40)
+    card.BorderSizePixel = 0
+    card.LayoutOrder = layoutOrder
+    card.Parent = ContentScroll
+    
+    local cCorner = Instance.new("UICorner")
+    cCorner.CornerRadius = UDim.new(0, 8)
+    cCorner.Parent = card
+    
+    local cStroke = Instance.new("UIStroke")
+    cStroke.Color = Color3.fromRGB(39, 44, 70)
+    cStroke.Thickness = 1
+    cStroke.Parent = card
+    
+    local cTitle = Instance.new("TextLabel")
+    cTitle.Text = titleText
+    cTitle.Font = Enum.Font.GothamBold
+    cTitle.TextSize = 13
+    cTitle.TextColor3 = Color3.fromRGB(233, 213, 255)
+    cTitle.TextXAlignment = Enum.TextXAlignment.Left
+    cTitle.Position = UDim2.fromOffset(12, 8)
+    cTitle.Size = UDim2.new(1, -24, 0, 18)
+    cTitle.BackgroundTransparency = 1
+    cTitle.Parent = card
+    
+    return card
+end
+
+-- ====================================================================
+-- Card 1: Rod & Bait Selection
+-- ====================================================================
+local Card1 = createCard("1. เลือกเบ็ดตกปลา และ เหยื่อที่ใช้", 120, 1)
+
+local rodBtnSpider = Instance.new("TextButton")
+rodBtnSpider.Size = UDim2.new(0.5, -16, 0, 32)
+rodBtnSpider.Position = UDim2.fromOffset(12, 32)
+rodBtnSpider.Text = "เบ็ดใยทมิฬ (2.5k)"
+rodBtnSpider.Font = Enum.Font.GothamBold
+rodBtnSpider.TextSize = 11
+rodBtnSpider.Parent = Card1
+
+local rodBtnTiktok = Instance.new("TextButton")
+rodBtnTiktok.Size = UDim2.new(0.5, -16, 0, 32)
+rodBtnTiktok.Position = UDim2.new(0.5, 4, 0, 32)
+rodBtnTiktok.Text = "เบ็ดตกปลา (10k)"
+rodBtnTiktok.Font = Enum.Font.GothamBold
+rodBtnTiktok.TextSize = 11
+rodBtnTiktok.Parent = Card1
+
+local baitBtnSpider = Instance.new("TextButton")
+baitBtnSpider.Size = UDim2.new(0.5, -16, 0, 32)
+baitBtnSpider.Position = UDim2.fromOffset(12, 72)
+baitBtnSpider.Text = "เหยื่อแมงมุม (1k)"
+baitBtnSpider.Font = Enum.Font.GothamBold
+baitBtnSpider.TextSize = 11
+baitBtnSpider.Parent = Card1
+
+local baitBtnChubby = Instance.new("TextButton")
+baitBtnChubby.Size = UDim2.new(0.5, -16, 0, 32)
+baitBtnChubby.Position = UDim2.new(0.5, 4, 0, 72)
+baitBtnChubby.Text = "เหยื่อ Chubby (200)"
+baitBtnChubby.Font = Enum.Font.GothamBold
+baitBtnChubby.TextSize = 11
+baitBtnChubby.Parent = Card1
+
+for _, btn in ipairs({rodBtnSpider, rodBtnTiktok, baitBtnSpider, baitBtnChubby}) do
+    local bCorner = Instance.new("UICorner")
+    bCorner.CornerRadius = UDim.new(0, 6)
+    bCorner.Parent = btn
+    local bStroke = Instance.new("UIStroke")
+    bStroke.Thickness = 1
+    bStroke.Parent = btn
+end
+
+local function updateSelectionStyles()
+    -- Rods
+    if State.selectedRod == "RodSpider" then
+        rodBtnSpider.BackgroundColor3 = Color3.fromRGB(147, 51, 234)
+        rodBtnSpider.TextColor3 = Color3.fromRGB(255, 255, 255)
+        rodBtnTiktok.BackgroundColor3 = Color3.fromRGB(29, 34, 56)
+        rodBtnTiktok.TextColor3 = Color3.fromRGB(148, 163, 184)
+    else
+        rodBtnTiktok.BackgroundColor3 = Color3.fromRGB(147, 51, 234)
+        rodBtnTiktok.TextColor3 = Color3.fromRGB(255, 255, 255)
+        rodBtnSpider.BackgroundColor3 = Color3.fromRGB(29, 34, 56)
+        rodBtnSpider.TextColor3 = Color3.fromRGB(148, 163, 184)
+    end
+    -- Baits
+    if State.selectedBait == "BaitSpider" then
+        baitBtnSpider.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+        baitBtnSpider.TextColor3 = Color3.fromRGB(255, 255, 255)
+        baitBtnChubby.BackgroundColor3 = Color3.fromRGB(29, 34, 56)
+        baitBtnChubby.TextColor3 = Color3.fromRGB(148, 163, 184)
+    else
+        baitBtnChubby.BackgroundColor3 = Color3.fromRGB(56, 189, 248)
+        baitBtnChubby.TextColor3 = Color3.fromRGB(255, 255, 255)
+        baitBtnSpider.BackgroundColor3 = Color3.fromRGB(29, 34, 56)
+        baitBtnSpider.TextColor3 = Color3.fromRGB(148, 163, 184)
+    end
+end
+
+rodBtnSpider.MouseButton1Click:Connect(function()
+    State.selectedRod = "RodSpider"
+    State.selectedBait = "BaitSpider"
+    updateSelectionStyles()
+end)
+
+rodBtnTiktok.MouseButton1Click:Connect(function()
+    State.selectedRod = "RodTiktok"
+    State.selectedBait = "BaitChubby"
+    updateSelectionStyles()
+end)
+
+baitBtnSpider.MouseButton1Click:Connect(function()
+    State.selectedBait = "BaitSpider"
+    updateSelectionStyles()
+end)
+
+baitBtnChubby.MouseButton1Click:Connect(function()
+    State.selectedBait = "BaitChubby"
+    updateSelectionStyles()
+end)
+
+updateSelectionStyles()
+
+-- ====================================================================
+-- Card 2: Auto Buy Bait
+-- ====================================================================
+local Card2 = createCard("2. ซื้อเหยื่ออัตโนมัติในร้านค้า (Auto Buy)", 95, 2)
+
+local autoBuyToggle = Instance.new("TextButton")
+autoBuyToggle.Size = UDim2.new(0.5, -16, 0, 32)
+autoBuyToggle.Position = UDim2.fromOffset(12, 32)
+autoBuyToggle.Font = Enum.Font.GothamBold
+autoBuyToggle.TextSize = 12
+autoBuyToggle.Parent = Card2
+local abCorner = Instance.new("UICorner")
+abCorner.CornerRadius = UDim.new(0, 6)
+abCorner.Parent = autoBuyToggle
+
+local function updateBuyToggleStyle()
+    if State.autoBuyBait then
+        autoBuyToggle.Text = "Auto Buy: เปิด [ON]"
+        autoBuyToggle.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
+        autoBuyToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        autoBuyToggle.Text = "Auto Buy: ปิด [OFF]"
+        autoBuyToggle.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+        autoBuyToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end
+end
+
+autoBuyToggle.MouseButton1Click:Connect(function()
+    State.autoBuyBait = not State.autoBuyBait
+    updateBuyToggleStyle()
+end)
+updateBuyToggleStyle()
+
+local amtContainer = Instance.new("Frame")
+amtContainer.Size = UDim2.new(0.5, -16, 0, 32)
+amtContainer.Position = UDim2.new(0.5, 4, 0, 32)
+amtContainer.BackgroundTransparency = 1
+amtContainer.Parent = Card2
+
+local amtBtns = {}
+for i, amt in ipairs({5, 10, 20}) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.33, -4, 1, 0)
+    btn.Position = UDim2.new((i - 1) * 0.33, 2, 0, 0)
+    btn.Text = "x" .. amt
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 11
+    btn.Parent = amtContainer
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 6)
+    c.Parent = btn
+    
+    btn.MouseButton1Click:Connect(function()
+        State.buyAmount = amt
+        for _, b in pairs(amtBtns) do
+            b.BackgroundColor3 = Color3.fromRGB(29, 34, 56)
+            b.TextColor3 = Color3.fromRGB(148, 163, 184)
+        end
+        btn.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end)
+    amtBtns[amt] = btn
+    if amt == State.buyAmount then
+        btn.BackgroundColor3 = Color3.fromRGB(168, 85, 247)
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        btn.BackgroundColor3 = Color3.fromRGB(29, 34, 56)
+        btn.TextColor3 = Color3.fromRGB(148, 163, 184)
+    end
+end
+
+local liveBaitInfo = Instance.new("TextLabel")
+liveBaitInfo.Text = "เหยื่อในกระเป๋า: 0 ชิ้น | เงินคงเหลือ: 0 ฿"
+liveBaitInfo.Font = Enum.Font.GothamMedium
+liveBaitInfo.TextSize = 11
+liveBaitInfo.TextColor3 = Color3.fromRGB(192, 132, 252)
+liveBaitInfo.TextXAlignment = Enum.TextXAlignment.Left
+liveBaitInfo.Position = UDim2.fromOffset(12, 70)
+liveBaitInfo.Size = UDim2.new(1, -24, 0, 16)
+liveBaitInfo.BackgroundTransparency = 1
+liveBaitInfo.Parent = Card2
+
+-- ====================================================================
+-- Card 3: Auto Stash All (เก็บของเข้าคลังทั้งหมดเมื่อกระเป๋าเต็ม)
+-- ====================================================================
+local Card3 = createCard("3. ระบบเก็บของเข้าคลัง (Auto Stash)", 95, 3)
+
+local autoStashToggle = Instance.new("TextButton")
+autoStashToggle.Size = UDim2.new(0.55, -16, 0, 32)
+autoStashToggle.Position = UDim2.fromOffset(12, 32)
+autoStashToggle.Font = Enum.Font.GothamBold
+autoStashToggle.TextSize = 12
+autoStashToggle.Parent = Card3
+local asCorner = Instance.new("UICorner")
+asCorner.CornerRadius = UDim.new(0, 6)
+asCorner.Parent = autoStashToggle
+
+local function updateStashToggleStyle()
+    if State.autoStash then
+        autoStashToggle.Text = "Auto Stash: เปิด [ON]"
+        autoStashToggle.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
+        autoStashToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        autoStashToggle.Text = "Auto Stash: ปิด [OFF]"
+        autoStashToggle.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+        autoStashToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end
+end
+
+autoStashToggle.MouseButton1Click:Connect(function()
+    State.autoStash = not State.autoStash
+    updateStashToggleStyle()
+end)
+updateStashToggleStyle()
+
+local manualStashBtn = Instance.new("TextButton")
+manualStashBtn.Size = UDim2.new(0.45, -12, 0, 32)
+manualStashBtn.Position = UDim2.new(0.55, 4, 0, 32)
+manualStashBtn.BackgroundColor3 = Color3.fromRGB(46, 28, 77)
+manualStashBtn.Text = "📥 เก็บเข้าคลังทันที"
+manualStashBtn.TextColor3 = Color3.fromRGB(243, 232, 255)
+manualStashBtn.Font = Enum.Font.GothamBold
+manualStashBtn.TextSize = 11
+manualStashBtn.Parent = Card3
+local msCorner = Instance.new("UICorner")
+msCorner.CornerRadius = UDim.new(0, 6)
+msCorner.Parent = manualStashBtn
+
+manualStashBtn.MouseButton1Click:Connect(function()
+    performAutoStash()
+end)
+
+local bagCapacityLabel = Instance.new("TextLabel")
+bagCapacityLabel.Text = "ความจุ: ช่องว่าง 0/100 | น้ำหนัก: 0/120"
+bagCapacityLabel.Font = Enum.Font.GothamMedium
+bagCapacityLabel.TextSize = 11
+bagCapacityLabel.TextColor3 = Color3.fromRGB(148, 163, 184)
+bagCapacityLabel.TextXAlignment = Enum.TextXAlignment.Left
+bagCapacityLabel.Position = UDim2.fromOffset(12, 70)
+bagCapacityLabel.Size = UDim2.new(1, -24, 0, 16)
+bagCapacityLabel.BackgroundTransparency = 1
+bagCapacityLabel.Parent = Card3
+
+-- ====================================================================
+-- Card 4: Fishing Spot (เดินเอง ไม่วาป ไม่บิน)
+-- ====================================================================
+local Card4 = createCard("4. จุดตกปลา (เดินเอง ไม่วาป ไม่บิน)", 135, 4)
+
+local setSpotBtn = Instance.new("TextButton")
+setSpotBtn.Size = UDim2.new(0.68, -12, 0, 34)
+setSpotBtn.Position = UDim2.fromOffset(12, 32)
+setSpotBtn.BackgroundColor3 = Color3.fromRGB(147, 51, 234)
+setSpotBtn.Text = "📍 เซ็ตจุดตกปลาตรงนี้"
+setSpotBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+setSpotBtn.Font = Enum.Font.GothamBold
+setSpotBtn.TextSize = 12
+setSpotBtn.Parent = Card4
+local ssCorner = Instance.new("UICorner")
+ssCorner.CornerRadius = UDim.new(0, 6)
+ssCorner.Parent = setSpotBtn
+
+local clearSpotBtn = Instance.new("TextButton")
+clearSpotBtn.Size = UDim2.new(0.32, -12, 0, 34)
+clearSpotBtn.Position = UDim2.new(0.68, 4, 0, 32)
+clearSpotBtn.BackgroundColor3 = Color3.fromRGB(46, 28, 77)
+clearSpotBtn.Text = "ล้างจุด"
+clearSpotBtn.TextColor3 = Color3.fromRGB(243, 232, 255)
+clearSpotBtn.Font = Enum.Font.GothamBold
+clearSpotBtn.TextSize = 12
+clearSpotBtn.Parent = Card4
+local csCorner = Instance.new("UICorner")
+csCorner.CornerRadius = UDim.new(0, 6)
+csCorner.Parent = clearSpotBtn
+
+local spotCoords = Instance.new("TextLabel")
+spotCoords.Text = "พิกัด: ยังไม่ได้เซ็ต (กรุณาเดินไปริมน้ำแล้วกดเซ็ต)"
+spotCoords.Font = Enum.Font.GothamMedium
+spotCoords.TextSize = 11
+spotCoords.TextColor3 = Color3.fromRGB(148, 163, 184)
+spotCoords.TextXAlignment = Enum.TextXAlignment.Left
+spotCoords.Position = UDim2.fromOffset(12, 72)
+spotCoords.Size = UDim2.new(1, -24, 0, 16)
+spotCoords.BackgroundTransparency = 1
+spotCoords.Parent = Card4
+
+local distBadge = Instance.new("TextLabel")
+distBadge.Text = "ระยะห่าง: ยังไม่มีจุด"
+distBadge.Font = Enum.Font.GothamBold
+distBadge.TextSize = 11
+distBadge.TextColor3 = Color3.fromRGB(251, 191, 36)
+distBadge.TextXAlignment = Enum.TextXAlignment.Left
+distBadge.Position = UDim2.fromOffset(12, 92)
+distBadge.Size = UDim2.new(1, -24, 0, 16)
+distBadge.BackgroundTransparency = 1
+distBadge.Parent = Card4
+
+local walkNote = Instance.new("TextLabel")
+walkNote.Text = "💡 เมื่อเซ็ตแล้ว คุณสามารถเดินไปมาได้เอง เมื่อเดินมาถึงจุดจะเริ่มตกทันที"
+walkNote.Font = Enum.Font.Gotham
+walkNote.TextSize = 10
+walkNote.TextColor3 = Color3.fromRGB(148, 163, 184)
+walkNote.TextXAlignment = Enum.TextXAlignment.Left
+walkNote.Position = UDim2.fromOffset(12, 112)
+walkNote.Size = UDim2.new(1, -24, 0, 16)
+walkNote.BackgroundTransparency = 1
+walkNote.Parent = Card4
+
+setSpotBtn.MouseButton1Click:Connect(function()
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        spotCoords.Text = "❌ ไม่พบตัวละคร"
+        return
+    end
+    
+    local target = calculateCastTarget()
+    State.savedSpot = {
+        playerPos = hrp.Position,
+        castPos = target or (hrp.Position + hrp.CFrame.LookVector * 28)
+    }
+    updateMarkers()
+    
+    spotCoords.Text = string.format("พิกัดยืน: (%.1f, %.1f, %.1f)", hrp.Position.X, hrp.Position.Y, hrp.Position.Z)
+    spotCoords.TextColor3 = Color3.fromRGB(168, 85, 247)
+    State.statusText = "บันทึกจุดตกปลาเรียบร้อยแล้ว!"
+end)
+
+clearSpotBtn.MouseButton1Click:Connect(function()
+    State.savedSpot = nil
+    updateMarkers()
+    spotCoords.Text = "พิกัด: ยังไม่ได้เซ็ต (กรุณาเดินไปริมน้ำแล้วกดเซ็ต)"
+    spotCoords.TextColor3 = Color3.fromRGB(148, 163, 184)
+    distBadge.Text = "ระยะห่าง: ยังไม่มีจุด"
+    distBadge.TextColor3 = Color3.fromRGB(251, 191, 36)
+end)
+
+-- ====================================================================
+-- Card 5: Main Controller (Auto Fishing)
+-- ====================================================================
+local Card5 = createCard("5. เริ่มทำงาน (Auto Fishing)", 140, 5)
+
+local MainToggleBtn = Instance.new("TextButton")
+MainToggleBtn.Size = UDim2.new(1, -24, 0, 40)
+MainToggleBtn.Position = UDim2.fromOffset(12, 32)
+MainToggleBtn.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
+MainToggleBtn.Text = "▶ เริ่มตกปลาอัตโนมัติ (START)"
+MainToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+MainToggleBtn.Font = Enum.Font.GothamBlack
+MainToggleBtn.TextSize = 14
+MainToggleBtn.Parent = Card5
+local mtCorner = Instance.new("UICorner")
+mtCorner.CornerRadius = UDim.new(0, 8)
+mtCorner.Parent = MainToggleBtn
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Text = "สถานะ: " .. State.statusText
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.TextSize = 12
+statusLabel.TextColor3 = Color3.fromRGB(243, 232, 255)
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Position = UDim2.fromOffset(12, 78)
+statusLabel.Size = UDim2.new(1, -24, 0, 18)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Parent = Card5
+
+local statsLabel = Instance.new("TextLabel")
+statsLabel.Text = "ตกได้สำเร็จ: 0 ครั้ง | ได้ล่าสุด: -"
+statsLabel.Font = Enum.Font.GothamMedium
+statsLabel.TextSize = 11
+statsLabel.TextColor3 = Color3.fromRGB(192, 132, 252)
+statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+statsLabel.Position = UDim2.fromOffset(12, 98)
+statsLabel.Size = UDim2.new(1, -24, 0, 18)
+statsLabel.BackgroundTransparency = 1
+statsLabel.Parent = Card5
+
+local function updateMainToggleStyle()
+    if State.enabled then
+        MainToggleBtn.Text = "⏹ หยุดทำงาน (STOP AUTO FISH)"
+        MainToggleBtn.BackgroundColor3 = Color3.fromRGB(239, 68, 68)
+    else
+        MainToggleBtn.Text = "▶ เริ่มตกปลาอัตโนมัติ (START)"
+        MainToggleBtn.BackgroundColor3 = Color3.fromRGB(34, 197, 94)
+    end
+end
+
+MainToggleBtn.MouseButton1Click:Connect(function()
+    State.enabled = not State.enabled
+    updateMainToggleStyle()
+    if State.enabled then
+        if not State.savedSpot then
+            State.statusText = "กรุณากด 'เซ็ตจุดตกปลา' ก่อน"
+        else
+            State.statusText = "ระบบเริ่มทำงานแล้ว..."
+        end
+    else
+        State.statusText = "ระบบหยุดทำงานชั่วคราว"
+    end
+end)
+
+-- UI Live Updater Loop
+task.spawn(function()
+    while ScreenGui.Parent and _G.LunarHubRunning do
+        task.wait(0.35)
+        
+        -- Distance update
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and State.savedSpot then
+            local dist = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(State.savedSpot.playerPos.X, 0, State.savedSpot.playerPos.Z)).Magnitude
+            if dist <= State.maxDistanceTolerance then
+                distBadge.Text = string.format("ระยะห่าง: %.1f m [✓ อยู่ตรงจุดตกปลา]", dist)
+                distBadge.TextColor3 = Color3.fromRGB(52, 211, 153)
+            else
+                distBadge.Text = string.format("ระยะห่าง: %.1f m [🏃 กรุณาเดินไปยังจุด]", dist)
+                distBadge.TextColor3 = Color3.fromRGB(248, 113, 113)
+            end
+        end
+        
+        -- Bait & Money update
+        local bCount = countBait(State.selectedBait)
+        local money = getMoney()
+        local baitName = State.selectedBait == "BaitSpider" and "เหยื่อแมงมุม" or "เหยื่อ Chubby"
+        liveBaitInfo.Text = string.format("%s: %d ชิ้น | เงินคงเหลือ: %s ฿", baitName, bCount, tostring(money))
+        
+        -- Backpack capacity update
+        local emptySlots, filledSlots, weight, weightMax = getBackpackCapacity()
+        bagCapacityLabel.Text = string.format("ช่องในกระเป๋า: ว่าง %d ช่อง (มีของ %d) | น้ำหนัก: %.1f / %.1f", emptySlots, filledSlots, weight, weightMax)
+        if emptySlots <= 2 then
+            bagCapacityLabel.TextColor3 = Color3.fromRGB(248, 113, 113)
+        else
+            bagCapacityLabel.TextColor3 = Color3.fromRGB(148, 163, 184)
+        end
+        
+        -- Status & Stats
+        statusLabel.Text = "สถานะ: " .. State.statusText
+        statsLabel.Text = string.format("ตกได้สำเร็จ: %d ครั้ง | ได้ล่าสุด: %s", State.totalCatches, State.lastLoot)
+    end
+end)
+
+-- Cleanup Handler
+_G.LunarHubCleanup = function()
+    _G.LunarHubRunning = false
+    if stateConnection then stateConnection:Disconnect() end
+    if reelConnection then reelConnection:Disconnect() end
+    if ScreenGui then ScreenGui:Destroy() end
+    if VisualFolder then VisualFolder:Destroy() end
+end
+
+print("[🌙 LUNAR HUB] Loaded successfully! Floating button & GUI ready.")
